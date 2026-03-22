@@ -1,10 +1,41 @@
+import csv
+import glob
 import json
 import os
 import re
-from typing import Dict, List, Optional
+import sys
+import time
+from urllib.parse import urljoin
 
-REFERENCE_FILE = "watchlist_reference.txt"
+import requests
+from bs4 import BeautifulSoup
+
+LETTERBOXD_URL = "https://letterboxd.com/miscalim/watchlist/"
+LETTERBOXD_USERNAME = "miscalim"
+LETTERBOXD_BASE = "https://letterboxd.com"
+
+SEARCH_FOLDERS = [
+    ".",
+    "/storage/emulated/0/Download",
+    "/sdcard/Download",
+]
+
+CSV_PATTERNS = [
+    "*watchlist*.csv",
+    "*imdb*.csv",
+    "*.csv",
+]
+
 OUTPUT_FILE = "movies.json"
+TMP_OUTPUT_FILE = "movies.tmp.json"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 def normalize_title(title: str) -> str:
@@ -18,136 +49,371 @@ def normalize_title(title: str) -> str:
     return t
 
 
-def parse_movie_line(line: str) -> Optional[Dict]:
-    line = line.strip()
+def sort_movies(movies):
+    return sorted(movies, key=lambda x: x["title"].lower())
 
-    # Standard format:
-    # 1. Movie Title [2024, Genre, Genre]
-    match = re.match(r"^\d+\.\s+(.*?)\s+\[(.*?)\]\s*$", line)
-    if not match:
+
+def safe_get(url: str, timeout: int = 20):
+    try:
+        return requests.get(url, headers=HEADERS, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        print(f"[Request failed] {url} -> {e}")
         return None
 
-    title = match.group(1).strip()
-    raw_details = match.group(2).strip()
 
-    parts = [x.strip() for x in raw_details.split(",") if x.strip()]
+def try_find_film_url_from_img(img):
+    a = img.find_parent("a", href=True)
+    if a:
+        href = (a.get("href") or "").strip()
+        if "/film/" in href:
+            return urljoin(LETTERBOXD_BASE, href.split("?")[0])
+
+    for ancestor in img.parents:
+        attrs = getattr(ancestor, "attrs", None)
+        if not attrs:
+            continue
+
+        data_target_link = attrs.get("data-target-link", "")
+        if data_target_link and "/film/" in data_target_link:
+            return urljoin(LETTERBOXD_BASE, data_target_link.split("?")[0])
+
+        href = attrs.get("href", "")
+        if href and "/film/" in href:
+            return urljoin(LETTERBOXD_BASE, href.split("?")[0])
+
+    return ""
+
+
+def extract_letterboxd_entries_from_page(soup, username_to_exclude=""):
+    entries = []
+    seen = set()
+    excluded_norm = normalize_title(username_to_exclude) if username_to_exclude else ""
+
+    for img in soup.find_all("img", alt=True):
+        title = (img.get("alt") or "").strip()
+        if not title:
+            continue
+
+        norm = normalize_title(title)
+        if not norm:
+            continue
+        if norm == "letterboxd":
+            continue
+        if excluded_norm and norm == excluded_norm:
+            continue
+        if norm in seen:
+            continue
+
+        seen.add(norm)
+        entries.append({
+            "title": title,
+            "film_url": try_find_film_url_from_img(img),
+        })
+
+    return entries
+
+
+def scrape_letterboxd_film_details(film_url: str):
     year = ""
-    genres: List[str] = []
+    genres = ""
 
-    for part in parts:
-        if re.fullmatch(r"\d{4}", part):
-            year = part
-        else:
-            genres.append(part)
+    if not film_url:
+        return year, genres
 
-    return {
-        "title": title,
-        "year": year,
-        "year_num": int(year) if year.isdigit() else 0,
-        "genres": ", ".join(genres),
-    }
+    response = safe_get(film_url, timeout=20)
+    if response is None or response.status_code != 200:
+        return year, genres
+
+    try:
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        year_link = soup.find("a", href=re.compile(r"/year/\d{4}/"))
+        if year_link:
+            y = year_link.get_text(" ", strip=True)
+            if re.fullmatch(r"\d{4}", y):
+                year = y
+
+        if not year:
+            text = soup.get_text(" ", strip=True)
+            match = re.search(r"\b(18|19|20)\d{2}\b", text)
+            if match:
+                year = match.group(0)
+
+        genre_links = soup.find_all("a", href=re.compile(r"/films/genre/"))
+        genre_list = []
+        seen = set()
+
+        for g in genre_links:
+            gt = g.get_text(" ", strip=True)
+            gt = re.sub(r"\s+", " ", gt).strip()
+            if not gt:
+                continue
+            low = gt.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            genre_list.append(gt)
+
+        if genre_list:
+            genres = ", ".join(genre_list)
+
+    except Exception as e:
+        print(f"[Letterboxd detail parse failed] {film_url} -> {e}")
+
+    return year, genres
 
 
-def split_sections(text: str) -> Dict[str, List[Dict]]:
-    current = None
-    sections = {
-        "letterboxd": [],
-        "imdb": [],
-        "overlaps": [],
-        "only_letterboxd": [],
-        "only_imdb": [],
-    }
+def get_letterboxd_movies(base_url, username_to_exclude=""):
+    movies = []
+    page = 1
+    known_norms = set()
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
+    print("[Start] Scraping Letterboxd")
 
-        if "LETTERBOXD MOVIES, ALPHABETICAL" in line:
-            current = "letterboxd"
+    while True:
+        url = base_url if page == 1 else base_url.rstrip("/") + f"/page/{page}/"
+        print(f"[Letterboxd] Checking page {page}: {url}")
+
+        response = safe_get(url, timeout=20)
+        if response is None:
+            print("[Letterboxd] Request failed, stopping.")
+            break
+
+        if response.status_code != 200:
+            print(f"[Letterboxd] Stopped, status {response.status_code}")
+            break
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        page_entries = extract_letterboxd_entries_from_page(
+            soup,
+            username_to_exclude=username_to_exclude
+        )
+
+        if not page_entries:
+            print("[Letterboxd] No more titles found, stopping.")
+            break
+
+        new_count = 0
+        for entry in page_entries:
+            norm = normalize_title(entry["title"])
+            if norm in known_norms:
+                continue
+
+            known_norms.add(norm)
+            movies.append({
+                "title": entry["title"],
+                "year": "",
+                "year_num": 0,
+                "genres": "",
+                "on_imdb": False,
+                "on_letterboxd": True,
+                "is_overlap": False,
+                "film_url": entry["film_url"],
+            })
+            new_count += 1
+
+        print(f"[Letterboxd] Found {new_count} new titles on page {page}")
+
+        if new_count == 0:
+            print("[Letterboxd] No new titles added, stopping.")
+            break
+
+        page += 1
+        time.sleep(1)
+
+    got_urls = len([m for m in movies if m.get("film_url")])
+    print(f"[Letterboxd] Found detail page URLs for {got_urls} of {len(movies)} films")
+
+    if got_urls:
+        print(f"[Letterboxd] Fetching details for {got_urls} films")
+
+    for idx, movie in enumerate(movies, start=1):
+        if movie.get("film_url"):
+            year, genres = scrape_letterboxd_film_details(movie["film_url"])
+            movie["year"] = year
+            movie["year_num"] = int(year) if year.isdigit() else 0
+            movie["genres"] = genres
+
+        if idx % 10 == 0 or idx == len(movies):
+            print(f"[Letterboxd Details] {idx}/{len(movies)}")
+
+        time.sleep(0.3)
+
+    for movie in movies:
+        movie.pop("film_url", None)
+
+    return sort_movies(movies)
+
+
+def find_newest_csv():
+    candidates = []
+
+    for folder in SEARCH_FOLDERS:
+        if not os.path.isdir(folder):
             continue
-        if "IMDB MOVIES FROM CSV, ALPHABETICAL" in line:
-            current = "imdb"
-            continue
-        if "OVERLAPS, ALPHABETICAL" in line:
-            current = "overlaps"
-            continue
-        if "ONLY IN LETTERBOXD" in line:
-            current = "only_letterboxd"
-            continue
-        if "ONLY IN IMDB" in line:
-            current = "only_imdb"
-            continue
 
-        if not current:
-            continue
+        for pattern in CSV_PATTERNS:
+            full_pattern = os.path.join(folder, pattern)
+            for path in glob.glob(full_pattern):
+                if os.path.isfile(path):
+                    candidates.append(path)
 
-        movie = parse_movie_line(line)
-        if movie:
-            sections[current].append(movie)
+    if not candidates:
+        return None
 
-    return sections
+    candidates = sorted(candidates, key=os.path.getmtime, reverse=True)
+    return candidates[0]
 
 
-def build_movies(sections: Dict[str, List[Dict]]) -> List[Dict]:
-    merged: Dict[str, Dict] = {}
+def parse_imdb_csv(csv_path):
+    if not csv_path:
+        return []
 
-    for movie in sections["letterboxd"]:
-        norm = normalize_title(movie["title"])
-        merged[norm] = {
-            "title": movie["title"],
-            "year": movie["year"],
-            "year_num": movie["year_num"],
-            "genres": movie["genres"],
-            "on_imdb": False,
-            "on_letterboxd": True,
-            "is_overlap": False,
-        }
+    print("[Start] Looking for newest IMDb CSV")
+    print(f"[IMDb CSV] Using file: {csv_path}")
 
-    for movie in sections["imdb"]:
-        norm = normalize_title(movie["title"])
-        if norm in merged:
-            merged[norm]["on_imdb"] = True
-            merged[norm]["is_overlap"] = True
+    movies = []
 
-            if not merged[norm]["year"] and movie["year"]:
-                merged[norm]["year"] = movie["year"]
-                merged[norm]["year_num"] = movie["year_num"]
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = reader.fieldnames or []
 
-            if not merged[norm]["genres"] and movie["genres"]:
-                merged[norm]["genres"] = movie["genres"]
-        else:
-            merged[norm] = {
-                "title": movie["title"],
-                "year": movie["year"],
-                "year_num": movie["year_num"],
-                "genres": movie["genres"],
+    print(f"[IMDb CSV] Columns found: {fieldnames}")
+
+    if not rows:
+        return []
+
+    title_field = "Title" if "Title" in fieldnames else None
+    year_field = "Year" if "Year" in fieldnames else None
+    genres_field = "Genres" if "Genres" in fieldnames else None
+
+    if not title_field:
+        print("[IMDb CSV] Could not find a Title column.")
+        return []
+
+    seen = set()
+
+    for row in rows:
+        title = (row.get(title_field) or "").strip()
+        year = (row.get(year_field) or "").strip() if year_field else ""
+        genres = (row.get(genres_field) or "").strip() if genres_field else ""
+
+        norm = normalize_title(title)
+        if norm and norm not in seen:
+            seen.add(norm)
+            movies.append({
+                "title": title,
+                "year": year,
+                "year_num": int(year) if year.isdigit() else 0,
+                "genres": genres,
                 "on_imdb": True,
                 "on_letterboxd": False,
                 "is_overlap": False,
-            }
+            })
 
-    movies = sorted(merged.values(), key=lambda x: x["title"].lower())
-    return movies
+    return sort_movies(movies)
 
 
-def main() -> None:
-    if not os.path.isfile(REFERENCE_FILE):
-        print(f"Missing file: {REFERENCE_FILE}")
-        return
+def merge_movies(letterboxd_movies, imdb_movies):
+    merged = {}
 
-    with open(REFERENCE_FILE, "r", encoding="utf-8") as f:
-        text = f.read()
+    for movie in letterboxd_movies:
+        norm = normalize_title(movie["title"])
+        if norm:
+            merged[norm] = dict(movie)
 
-    sections = split_sections(text)
-    movies = build_movies(sections)
+    for movie in imdb_movies:
+        norm = normalize_title(movie["title"])
+        if not norm:
+            continue
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        if norm in merged:
+            existing = merged[norm]
+            existing["on_imdb"] = True
+            existing["is_overlap"] = True
+
+            if not existing.get("year") and movie.get("year"):
+                existing["year"] = movie["year"]
+                existing["year_num"] = movie.get("year_num", 0)
+
+            if not existing.get("genres") and movie.get("genres"):
+                existing["genres"] = movie["genres"]
+        else:
+            merged[norm] = dict(movie)
+
+    return sort_movies(list(merged.values()))
+
+
+def validate_movies(movies):
+    if not isinstance(movies, list):
+        return False
+    if len(movies) == 0:
+        return False
+
+    required = {"title", "year", "year_num", "genres", "on_imdb", "on_letterboxd", "is_overlap"}
+    for movie in movies[:5]:
+        if not required.issubset(set(movie.keys())):
+            return False
+
+    return True
+
+
+def load_existing_movies():
+    if not os.path.isfile(OUTPUT_FILE):
+        return []
+
+    try:
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except Exception as e:
+        print(f"[Load existing movies failed] {e}")
+
+    return []
+
+
+def save_movies(movies):
+    with open(TMP_OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(movies, f, ensure_ascii=False, indent=2)
 
-    print(f"Wrote {len(movies)} movies to {OUTPUT_FILE}")
-    print(f"Letterboxd parsed: {len(sections['letterboxd'])}")
-    print(f"IMDb parsed: {len(sections['imdb'])}")
-    print(f"Overlaps parsed: {len(sections['overlaps'])}")
+    os.replace(TMP_OUTPUT_FILE, OUTPUT_FILE)
+
+
+def main():
+    existing_movies = load_existing_movies()
+
+    letterboxd_movies = []
+    imdb_movies = []
+
+    try:
+        letterboxd_movies = get_letterboxd_movies(LETTERBOXD_URL, LETTERBOXD_USERNAME)
+    except Exception as e:
+        print(f"[Letterboxd scrape failed] {e}")
+
+    try:
+        csv_path = find_newest_csv()
+        imdb_movies = parse_imdb_csv(csv_path) if csv_path else []
+        if not csv_path:
+            print("[IMDb CSV] No CSV file found.")
+    except Exception as e:
+        print(f"[IMDb parse failed] {e}")
+
+    merged_movies = merge_movies(letterboxd_movies, imdb_movies)
+
+    if validate_movies(merged_movies):
+        save_movies(merged_movies)
+        print(f"[Success] Wrote {len(merged_movies)} movies to {OUTPUT_FILE}")
+        return 0
+
+    if validate_movies(existing_movies):
+        print("[Fallback] New scrape was not valid, keeping existing movies.json")
+        return 0
+
+    print("[Failure] No valid new data and no valid existing movies.json")
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
